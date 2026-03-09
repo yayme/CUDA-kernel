@@ -28,4 +28,26 @@ __global__ void naive_attention(
         }
         S[t]= dot/sqrt((float)head_dim);
     }
+    // for numerical stability, we should calculate max of S[i,:]
+    float max_val = -1e9f;
+    for (int t=0;t <seq_len;t++)
+    {
+        if(S[t]>max_val)max_val = S[t];
+    }
+    float sum_exp = 0.0f;
+    for(int t=0;t<seq_len;t++)
+    { S[t]= expf(S[t]-max_val); // to prevent overflowing
+        sum_exp+= S[t];
+
+    }
+    for(int t=0;t<seq_len;t++)
+    {
+        S[t]=S[t]/sum_exp;
+    }
+    float output =0.0f;
+    for (int t=0;t<seq_len;t++)
+    {
+        out+= S[t]*V[t*head_dim+j];
+    }
+    out[j]= out;
 }
