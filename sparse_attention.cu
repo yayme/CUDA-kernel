@@ -56,8 +56,9 @@ __global__ void flash_attention_v2(
     // ── online softmax accumulators (replaces S[1024]) ──
     float m = -1e9f;      // running max
     float l = 0.0f;       // running sum of exp
-    float acc[D];         // running output
-    for (int k = 0; k < D; k++) acc[k] = 0.0f;
+    float acc =0.0f;    
+    int j= threadIdx.y;     // running output
+    // for (int k = 0; k < D; k++) acc[k] = 0.0f;
 
     for (int tile = 0; tile < seq_len / Bc; tile++)
     {
@@ -66,8 +67,8 @@ __global__ void flash_attention_v2(
         // sparsity check
         bool any_active = false;
         for (int i = tile_row_start; i < tile_row_start + Br && !any_active; i++)
-            for (int j = tile_col_start; j < tile_col_start + Bc && !any_active; j++)
-                if (i < seq_len && j < seq_len && mask[i * seq_len + j])
+            for (int jj = tile_col_start; jj < tile_col_start + Bc && !any_active; jj++)
+                if (i < seq_len && jj < seq_len && mask[i * seq_len + jj])
                     any_active = true;
         if (!any_active) continue;
 
@@ -104,16 +105,17 @@ __global__ void flash_attention_v2(
 
             // rescale old accumulator
             float scale = expf(m - m_new);
-            for (int k = 0; k < D; k++)
-                acc[k] *= scale;
+            // for (int k = 0; k < D; k++)
+            //     acc[k] *= scale;
+            acc*=scale;
 
             // accumulate new tile into output
             float l_tile = 0.0f;
             for (int t = 0; t < Bc; t++) {
                 float a = expf(scores[t] - m_new);
                 l_tile += a;
-                for (int k = 0; k < D; k++)
-                    acc[k] += a * Vs[t][k];
+                // for (int k = 0; k < D; k++)
+                acc += a * Vs[t][j];
             }
 
             // update running sum
@@ -126,9 +128,9 @@ __global__ void flash_attention_v2(
 
     // final output — divide by normalizer
     if (global_row < seq_len) {
-        int j = threadIdx.y;
+        // int j = threadIdx.y;
         if (j < D)
-            O[global_row * D + j] = acc[j] / l;
+            O[global_row * D + j] = acc / l;
     }
 }
 __global__ void flash_attention(    
