@@ -1,24 +1,22 @@
-# skip_attention
+# Sparse attention
 
-Sparse flash attention kernel in CUDA, exposed as a PyTorch extension.
+This is an exploratory project to implement a CUDA kernel for sparse attention with running max and benchmark its performance against PyTorch's dense attention. Built this to understand what actually happens inside Flash Attention and not just use it as a black box.
 
-## What it does
+The core idea: instead of computing attention between every pair of tokens (O(n²)), define a sparsity pattern and skip tiles that have no active token pairs entirely. The pattern used here is a local window of `w` nearby tokens plus global tokens every `s` steps — same idea as Longformer.
 
-Implements attention with a sparse mask: local window (`w` nearby tokens) + global stride (every `s` tokens). Tiles with no active pairs are skipped entirely — O(n·w) work vs O(n²) for dense.
-
-Two kernel versions:
-- **v1** — tiled shared memory; score array `S[N]` spills to global memory (O(N) registers per thread)
-- **v2** — online softmax (Flash Attention style); O(1) registers per thread, ~35–45% faster than v1
+---
 
 ## Files
 
-| File | Description |
-|------|-------------|
-| `sparse_attention.cu` | CUDA kernels (v1 + v2) |
-| `sparse_attention_ext.cpp` | PyTorch pybind11 wrapper |
-| `setup.py` | Build script |
-| `benchmark.ipynb` | Colab notebook: build, test, benchmark |
-| `log.md` | Dev log |
+| File | What it is |
+|------|------------|
+| `sparse_attention.cu` | The CUDA kernels — naive baseline, v1 (tiled shared memory), v2 (online softmax) |
+| `sparse_attention_ext.cpp` | pybind11 wrapper that exposes the kernels as a PyTorch extension |
+| `setup.py` | Compiles everything via `CUDAExtension` |
+| `benchmark.ipynb` | Colab notebook — builds the extension, runs correctness checks, plots benchmarks |
+| `log.md` | Dev log of every iteration, what broke, and why |
+
+---
 
 ## Build
 
@@ -28,6 +26,8 @@ python setup.py build_ext --inplace
 ```
 
 Tested on T4 GPU (CUDA 12.8, Python 3.12).
+
+---
 
 ## Usage
 
@@ -40,7 +40,7 @@ Q = torch.randn(N, D, device='cuda')
 K = torch.randn(N, D, device='cuda')
 V = torch.randn(N, D, device='cuda')
 
-# Build sparse mask: window=2, stride=4
+# build sparse mask: local window=2, global stride=4
 mask = torch.zeros(N, N, dtype=torch.int32)
 for i in range(N):
     for j in range(N):
@@ -48,31 +48,58 @@ for i in range(N):
             mask[i, j] = 1
 mask = mask.cuda()
 
-O = sa.sparse_attention_v2(Q, K, V, mask)   # v2 (online softmax, faster)
-# O = sa.sparse_attention(Q, K, V, mask)    # v1
+O = sa.sparse_attention_v2(Q, K, V, mask)  # v2 — online softmax, faster
+# O = sa.sparse_attention(Q, K, V, mask)   # v1 — tiled, S[N] spill version
 ```
 
-## Benchmarks (T4 GPU, head_dim=64, window=2, stride=4)
+---
+
+## How it works
+
+### Sparsity pattern
+Each query token `i` attends only to:
+- **Local window**: tokens within distance `w` → `abs(i-j) <= w`
+- **Global stride**: every `s`-th token → `j % s == 0`
+
+Everything else is masked out. The kernel checks each K/V tile before loading it — if no token pair in that tile is active, the tile is skipped entirely.
+
+### v1 — tiled shared memory
+Loads Q/K/V tiles into shared memory (SRAM) cooperatively so threads don't each fetch their own copy from global memory. Stores the full score array `S[N]` per thread, softmaxes at the end. Works, but `S[N]` spills to global memory as N grows — O(N) register usage per thread, which is why it gets slow fast.
+
+### v2 — online softmax
+Replaces `S[N]` with four scalars per thread: running max `m`, running denominator `l`, running output `acc`, and the thread's output column `j`. Updates these incrementally as each tile arrives — never needs to store the full score array. O(1) memory per thread regardless of sequence length. This is the core idea from the Flash Attention paper.
+
+---
+
+## Results
 
 ### v1 vs Dense (PyTorch)
-
 ![v1 vs Dense](assets/benchmark_v1_vs_dense.png)
 
-### v1 vs v2 vs Dense (PyTorch)
-
+### v1 vs v2 vs Dense
 ![v1 vs v2 vs Dense](assets/benchmark_v1_v2_vs_dense.png)
 
-| N | Dense | v1 | v2 | v2 speedup over v1 |
-|---|-------|----|----|-------------------|
+| N | Dense (PyTorch) | v1 | v2 | v2 speedup over v1 |
+|---|---|---|---|---|
 | 64 | 0.058 ms | 1.026 ms | 0.717 ms | 1.43× |
 | 128 | 0.057 ms | 0.794 ms | 0.547 ms | 1.45× |
 | 256 | 0.113 ms | 1.638 ms | 0.894 ms | 1.83× |
 | 512 | 0.088 ms | 5.145 ms | 3.371 ms | 1.53× |
 
-> Both custom kernels are slower than PyTorch dense (cuBLAS) at these sequence lengths. The sparsity advantage is expected to appear at N ≥ 2048 where O(n·w) beats O(n²).
+Both custom kernels are slower than PyTorch dense at these sequence lengths. That's expected — PyTorch uses cuBLAS which is optimized at the assembly level. The sparsity advantage should show up at N ≥ 2048 where skipping O(n²) tiles actually saves meaningful work vs the kernel launch overhead.
+
+The more interesting result is v2 vs v1 — the online softmax rewrite gives a consistent 1.4–1.8× speedup just by eliminating the `S[N]` array. Same algorithm, same sparsity pattern, just better memory behavior.
+
+---
 
 ## What's next
 
-- Precompute active tile list on CPU → pass as `(row_tile, col_tile)` pairs so GPU never checks, just skips
-- Test at N = 2048, 4096
-- Wrap in `nn.MultiheadAttention`-compatible Python class
+- **Precompute active tile list on CPU** — right now the `any_active` sparsity check runs inside the GPU kernel, reading global memory for every tile. This is doing extra work to avoid work. The fix is to precompute a list of `(row_tile, col_tile)` pairs on the CPU and pass it in, so the GPU just iterates the list and skips blindly.
+
+- **Test at N = 2048, 4096** — this is where sparse attention should actually win. At short sequences the kernel launch overhead dominates. At long sequences, skipping most of the O(n²) tiles is the whole point.
+
+- **Implement BLAST (Block Sparse Attention)** — planning to read the BLAST paper and implement their block sparsity pattern. More structured than the local+stride pattern here, better hardware utilization.
+
+- **Wrap in `nn.Module`** — make it drop-in compatible with `nn.MultiheadAttention` so it can slot into an existing transformer without rewriting the model.
+
+- **Multi-head support** — current kernel handles one head at a time. Real transformers run 8–96 heads in parallel. Need to add a batch/head dimension and launch accordingly.
