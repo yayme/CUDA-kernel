@@ -1,4 +1,5 @@
 #include<cuda_runtime.h>
+#include<torch/extension.h>
 #include<math.h>
 #include<stdio.h>
 #define D 64 // head dim
@@ -41,7 +42,7 @@ __global__ void flash_attention(
 {
     __shared__ float Qs[Br][D];
     __shared__ float Ks[Bc][D];
-    __shared__ float vs[Bc][D];
+    __shared__ float Vs[Bc][D];
     int tile_row_start = blockIdx.x*Br; // 
     int global_row = tile_row_start + threadIdx.x;
     if (global_row <seq_len && threadIdx.y <D)

@@ -1,5 +1,5 @@
 from setuptools import setup
-from torch.utlis.cpp_extension import BuildExtension, CUDAExtension;
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension;
 
 setup(
     name= "sparse_attention",
