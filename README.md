@@ -1,4 +1,4 @@
-# skip_attention
+# Sparse attention
 
 This is an exploratory project to implement a CUDA kernel for sparse attention and benchmark its performance against PyTorch's dense attention. Built this to understand what actually happens inside Flash Attention , not just use it as a black box.
 
