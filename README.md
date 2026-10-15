@@ -10,22 +10,51 @@ The core idea: instead of computing attention between every pair of tokens (O(n�
 
 | File | What it is |
 |------|------------|
-| `sparse_attention.cu` | The CUDA kernels — naive baseline, v1 (tiled shared memory), v2 (online softmax) |
-| `sparse_attention_ext.cpp` | pybind11 wrapper that exposes the kernels as a PyTorch extension |
-| `setup.py` | Compiles everything via `CUDAExtension` |
-| `benchmark.ipynb` | Colab notebook — builds the extension, runs correctness checks, plots benchmarks |
+| `csrc/sparse_attention.cu` | The CUDA kernels: naive baseline, v1 (tiled shared memory), v2 (online softmax), and their launchers |
+| `csrc/sparse_attention_ext.cpp` | pybind11 wrapper that exposes the kernels as a PyTorch extension |
+| `setup.py` | Compiles everything via `CUDAExtension` (prints registers and spills per kernel) |
+| `reference.py` | Sparsity mask builder and the fp64 reference attention used by tests and benchmarks |
+| `tests/test_correctness.py` | Every kernel against the reference, including N that isn't a multiple of 16 |
+| `bench/bench.py`, `bench/plot.py` | Benchmark against PyTorch baselines up to N=8192, then plot |
+| `bench/profile.py` | Runs one kernel once, for Nsight Compute |
+| `benchmark.ipynb` | Original Colab notebook (historical) |
+| `PLAN.md` | Step-by-step upgrade plan, one big idea per phase |
 | `log.md` | Dev log of every iteration, what broke, and why |
 
 ---
 
-## Build
+## Progress
+
+| Phase | Idea | Status |
+|---|---|---|
+| 0 | Measurement foundation: tests, benchmark, profiling | done |
+| 1 | Precomputed active-tile list (v3) | next |
+| 2 | Thread mapping: no redundant work, coalescing, occupancy (v4) | planned |
+| 3 | Double buffering (v5) | planned |
+| 4 | Tensor cores, fp16 WMMA (v6) | planned |
+| 5 | Batch + multi-head (v7) | planned |
+| 6 | Backward pass with recomputation (v8) | planned |
+| 7 | `nn.Module` + final write-up | planned |
+
+---
+
+## Build, test, benchmark
+
+Tested on a Colab T4 GPU (CUDA 12.8, Python 3.12). From the repo root:
 
 ```bash
-pip install torch
-python setup.py build_ext --inplace
+pip install -r requirements.txt
+python setup.py build_ext --inplace     # prints registers / spill bytes per kernel
+pytest -q tests                         # correctness vs fp64 reference
+python -m bench.bench                   # writes bench/results/results.csv
+python -m bench.plot                    # writes assets/bench_w*_s*.png
 ```
 
-Tested on T4 GPU (CUDA 12.8, Python 3.12).
+Profile one kernel with Nsight Compute:
+
+```bash
+ncu --set full -k regex:flash_attention -c 1 -o bench/results/v2_n4096 python -m bench.profile --kernel v2 --n 4096
+```
 
 ---
 
@@ -34,23 +63,20 @@ Tested on T4 GPU (CUDA 12.8, Python 3.12).
 ```python
 import torch
 import sparse_attention as sa
+from reference import build_mask
 
 N, D = 512, 64
-Q = torch.randn(N, D, device='cuda')
-K = torch.randn(N, D, device='cuda')
-V = torch.randn(N, D, device='cuda')
+Q, K, V = (torch.randn(N, D, device="cuda") for _ in range(3))
 
-# build sparse mask: local window=2, global stride=4
-mask = torch.zeros(N, N, dtype=torch.int32)
-for i in range(N):
-    for j in range(N):
-        if abs(i - j) <= 2 or j % 4 == 0:
-            mask[i, j] = 1
-mask = mask.cuda()
+# local window=32, global stride=512
+mask = build_mask(N, window=32, stride=512).int().contiguous()
 
-O = sa.sparse_attention_v2(Q, K, V, mask)  # v2 — online softmax, faster
-# O = sa.sparse_attention(Q, K, V, mask)   # v1 — tiled, S[N] spill version
+O = sa.sparse_attention_v2(Q, K, V, mask)  # v2: online softmax
+# O = sa.sparse_attention(Q, K, V, mask)   # v1: tiled, full score row (N <= 1024)
+# O = sa.naive_attention(Q, K, V)          # naive dense baseline (N <= 1024)
 ```
+
+Inputs must be contiguous float32 CUDA tensors of shape `[N, 64]`, and the mask must be int32 `[N, N]`.
 
 ---
 
@@ -86,6 +112,8 @@ Replaces `S[N]` with four scalars per thread: running max `m`, running denominat
 | 256 | 0.113 ms | 1.638 ms | 0.894 ms | 1.83× |
 | 512 | 0.088 ms | 5.145 ms | 3.371 ms | 1.53× |
 
+> **Caveat (found in Phase 0):** these numbers predate the correctness harness. The v1 kernel was computing a wrong answer then (masked keys got score 0 instead of −∞). Also, with window=2 and stride=4, every 16-wide tile holds a global token, so **no tile was ever skipped**. These numbers measure dense tiled attention. New results with a genuinely sparse pattern (window=32, stride=512) come from `bench/bench.py`. See `log.md`, Entry 8.
+
 Both custom kernels are slower than PyTorch dense at these sequence lengths. That's expected — PyTorch uses cuBLAS which is optimized at the assembly level. The sparsity advantage should show up at N ≥ 2048 where skipping O(n²) tiles actually saves meaningful work vs the kernel launch overhead.
 
 The more interesting result is v2 vs v1 — the online softmax rewrite gives a consistent 1.4–1.8× speedup just by eliminating the `S[N]` array. Same algorithm, same sparsity pattern, just better memory behavior.
@@ -109,12 +137,4 @@ The more interesting result is v2 vs v1 — the online softmax rewrite gives a c
 
 ## What's next
 
-- **Precompute active tile list on CPU** — right now the `any_active` sparsity check runs inside the GPU kernel, reading global memory for every tile. This is doing extra work to avoid work. The fix is to precompute a list of `(row_tile, col_tile)` pairs on the CPU and pass it in, so the GPU just iterates the list and skips blindly.
-
-- **Test at N = 2048, 4096** — this is where sparse attention should actually win. At short sequences the kernel launch overhead dominates. At long sequences, skipping most of the O(n²) tiles is the whole point.
-
-- **Implement BLAST (Block Sparse Attention)** — planning to read the BLAST paper and implement their block sparsity pattern. More structured than the local+stride pattern here, better hardware utilization.
-
-- **Wrap in `nn.Module`** — make it drop-in compatible with `nn.MultiheadAttention` so it can slot into an existing transformer without rewriting the model.
-
-- **Multi-head support** — current kernel handles one head at a time. Real transformers run 8–96 heads in parallel. Need to add a batch/head dimension and launch accordingly.
+The full step-by-step plan is in [`PLAN.md`](PLAN.md). Next up is Phase 1: precompute the list of active `(row_tile, col_tile)` pairs on the CPU and pass it in, so the kernel walks a list instead of scanning an N×N mask for every tile.

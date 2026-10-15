@@ -62,7 +62,23 @@ Linear growth means the sparsity check itself is the bottleneck now. The `any_ac
 
 ---
 
+## Entry 8 — Phase 0: measurement foundation
+Before optimizing anything else, built a way to know whether a change is correct and whether it helped (see `PLAN.md`).
+
+- **Repo layout:** kernels moved to `csrc/`, tests in `tests/`, benchmark/plot/profile scripts in `bench/`. `reference.py` holds the mask builder and an fp64 reference shared by tests and benchmarks.
+- **Correctness harness:** `pytest` compares every kernel against `softmax(masked QK^T/sqrt(d)) @ V` in fp64, over N ∈ {16, 17, 63, 64, 100, 512, 2048}, three sparsity patterns, two seeds.
+- **Input checks:** launchers now `TORCH_CHECK` device, dtype, contiguity and shape, launch on PyTorch's current stream, and check the launch with `C10_CUDA_KERNEL_LAUNCH_CHECK()`. Bad input is an error now, not silent garbage.
+- **Benchmark:** CUDA events, warmup, median, N up to 8192. Baselines are dense SDPA (speed ceiling) and masked SDPA (the fair comparison). Also reports useful GFLOP/s counting only active pairs.
+- **Build:** `-Xptxas -v` prints registers and spill bytes per kernel; `-lineinfo` lets Nsight Compute map stalls back to source lines.
+
+**Bugs caught while writing the harness:**
+- `grid(N/Br)` and `tile < seq_len/Bc` used integer division, so for N not a multiple of 16 the last rows were never computed. Switched to ceil-div and added bounds checks to the `any_active` scan (it could read past the end of the mask).
+- v1 initialised `S[]` to `0`, not to a very negative number. Masked and skipped keys therefore got score 0 and took real softmax weight, so **v1 was computing the wrong answer**, and the v1 numbers in the old benchmark are for an incorrect kernel. Fixed by initialising `S[t] = -1e9`.
+- v1 silently overflowed `S[1024]` for N > 1024. Now rejected with an error.
+
+**Finding: the original pattern never skipped a tile.** With window=2 and stride=4, every 16-wide key tile contains a multiple of 4, so 100% of tiles are active (25% of pairs). The tile-skipping code never fired, and the old benchmark measured dense tiled attention plus the cost of the skip check. The benchmark now also runs window=32, stride=512, where only 1.8% of pairs and 5% of tiles are active at N=4096. Lesson: sparsity has to exist at tile granularity, not just pair granularity.
+
+---
+
 ## What's next
-- Precompute active tile list on CPU, pass as a sorted array of `(row_tile, col_tile)` pairs
-- Test at N=2048, 4096 where sparse attention's O(n·w) advantage should finally show
-- Wrap everything in a proper Python class that matches the `nn.MultiheadAttention` interface
+Phase 1 in `PLAN.md`: precompute the list of active tiles on the CPU so the kernel walks a list instead of scanning an N×N mask.
