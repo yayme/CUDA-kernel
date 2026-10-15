@@ -9,7 +9,7 @@
 #define Bc 16           // key/value tile size
 #define MAX_SEQ_LEN 1024 // naive and v1 keep a full score row per thread, so they cap N
 
-static inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
+__host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 // Step 0 (naive): one thread per output element O[i][j], dense attention, no mask.
 // Every thread rebuilds the full score row from global memory.

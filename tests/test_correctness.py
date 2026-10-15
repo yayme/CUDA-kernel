@@ -6,7 +6,7 @@ from reference import build_mask, reference_attention
 
 if not torch.cuda.is_available():
     pytest.skip("needs a CUDA GPU", allow_module_level=True)
-sa = pytest.importorskip("sparse_attention")
+import sparse_attention as sa  # on a GPU machine a missing build must fail loudly, not skip
 
 D = 64
 SEQ_LENS = [16, 17, 63, 64, 100, 512, 2048]
